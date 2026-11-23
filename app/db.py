@@ -7,6 +7,7 @@ Data booking tidak pernah dihapus; hanya ``removed_at`` yang diisi.
 from __future__ import annotations
 
 import sqlite3
+import threading
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fields (
@@ -121,3 +122,29 @@ def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+class Database:
+    """Penyedia koneksi per-thread.
+
+    Endpoint FastAPI sinkron berjalan di threadpool, sedangkan scheduler
+    berjalan di thread event loop. Tiap thread memakai koneksinya sendiri agar
+    aman; SQLite mode WAL melayani banyak pembaca dan satu penulis.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._local = threading.local()
+
+    def conn(self) -> sqlite3.Connection:
+        existing = getattr(self._local, "conn", None)
+        if existing is None:
+            existing = connect(self.path)
+            self._local.conn = existing
+        return existing
+
+    def close(self) -> None:
+        existing = getattr(self._local, "conn", None)
+        if existing is not None:
+            existing.close()
+            self._local.conn = None

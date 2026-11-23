@@ -104,6 +104,9 @@ class AyoClient:
     async def fetch_calendar(self, date: str) -> list[dict[str, Any]]:
         """Ambil data kalender satu tanggal, tervalidasi (SPECS §3.3)."""
         token = self._token_provider()
+        if not token:
+            # Token belum diisi pemilik: jangan pernah mengirim request kosong.
+            raise FetchError("token_empty")
         try:
             response = await self._client.get(
                 self._base_url,

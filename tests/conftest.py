@@ -63,6 +63,12 @@ def make_config():
             poll_mid=600,
             poll_far=3600,
             event_retention_days=60,
+            expose_customer=True,
+            expose_customer_contact=False,
+            customer_enabled=False,
+            bind_host="127.0.0.1",
+            bind_port=8000,
+            log_level="INFO",
         )
         values.update(overrides)
         return Config(**values)

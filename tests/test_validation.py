@@ -60,6 +60,24 @@ def test_valid_fetch_returns_data(conn, lampiran_a):
     assert "field_ids" in mock.requests[0]
 
 
+def test_empty_token_never_sends_request():
+    """Token kosong (file belum diisi) tidak boleh memicu request ke AYO."""
+    with MockAyo() as mock:
+        client = _client(mock, token="")
+
+        async def run():
+            try:
+                await client.fetch_calendar(DATE)
+            except ayo_client.FetchError:
+                return "FetchError"
+            finally:
+                await client.aclose()
+            return None
+
+        assert asyncio.run(run()) == "FetchError"
+        assert mock.requests == []
+
+
 def test_invalid_responses_raise_expected_errors():
     with MockAyo() as mock:
         mock.set_raw("bukan json", 200, "application/json")

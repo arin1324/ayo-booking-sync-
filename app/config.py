@@ -37,6 +37,12 @@ class Config:
     poll_mid: int
     poll_far: int
     event_retention_days: int
+    expose_customer: bool
+    expose_customer_contact: bool
+    customer_enabled: bool
+    bind_host: str
+    bind_port: int
+    log_level: str
 
 
 def _as_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -57,6 +63,18 @@ def _as_float(env: Mapping[str, str], name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         raise ConfigError(f"{name} harus bilangan.") from None
+
+
+def _as_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} harus bernilai true/false.")
 
 
 def _as_int_tuple(
@@ -122,4 +140,10 @@ def load_config(
         poll_mid=_as_int(e, "AYO_POLL_MID", 600),
         poll_far=_as_int(e, "AYO_POLL_FAR", 3600),
         event_retention_days=_as_int(e, "EVENT_RETENTION_DAYS", 60),
+        expose_customer=_as_bool(e, "AYO_EXPOSE_CUSTOMER", True),
+        expose_customer_contact=_as_bool(e, "AYO_EXPOSE_CUSTOMER_CONTACT", False),
+        customer_enabled=_as_bool(e, "AYO_CUSTOMER_ENABLED", False),
+        bind_host=e.get("BIND_HOST", "127.0.0.1"),
+        bind_port=_as_int(e, "BIND_PORT", 8000),
+        log_level=(e.get("LOG_LEVEL") or "INFO").upper(),
     )
