@@ -6,11 +6,21 @@ membungkusnya dengan ``asyncio.to_thread`` pada milestone berikutnya.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
+import logging
+import random
 import sqlite3
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from . import db
+from . import clock, db
+from .ayo_client import AuthError, AyoClient, AyoError, TokenFile
+from .config import Config, ConfigError
+
+logger = logging.getLogger("ayo.sync")
 
 # Kolom yang dibandingkan saat menentukan ``updated`` (SPECS §5.6 langkah 2).
 TRACKED_COLUMNS = (
@@ -339,3 +349,366 @@ async def fetch_and_apply(
     """Ambil satu tanggal dari AYO lalu terapkan. Dipakai scheduler dan API."""
     data = await client.fetch_calendar(date)
     return apply_snapshot(conn, date, data, emit_events=emit_events, ts=ts)
+
+
+# --------------------------------------------------------------------------
+# Scheduler (SPECS §5.1–§5.4)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class SchedulerState:
+    """Keadaan dalam memori satu proses (bukan data yang perlu disimpan)."""
+
+    consecutive_failures: int = 0
+    pause_until: datetime | None = None
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def window_dates(today: date, window_days: int) -> list[str]:
+    """Tanggal target: hari ini - 1 sampai hari ini + (WINDOW_DAYS - 1)."""
+    start = today - timedelta(days=1)
+    return [(start + timedelta(days=offset)).isoformat() for offset in range(window_days + 1)]
+
+
+def offset_of(date_str: str, today: date) -> int:
+    return (date.fromisoformat(date_str) - today).days
+
+
+def interval_for_offset(offset: int, cfg: Config) -> int:
+    if offset <= -1:
+        return cfg.poll_yesterday
+    if offset in (0, 1):
+        return cfg.poll_near
+    if 2 <= offset <= 6:
+        return cfg.poll_mid
+    return cfg.poll_far
+
+
+def backoff_seconds(fail_count: int) -> int:
+    return min(300, 5 * (2 ** fail_count))
+
+
+def _is_due(
+    row: sqlite3.Row | None, interval: int, now: datetime, rng: random.Random | None
+) -> bool:
+    if row is None:
+        return True
+    fail_count = row["fail_count"] or 0
+    if fail_count > 0:
+        last_attempt = _parse_ts(row["last_attempt_at"])
+        if last_attempt is not None and (
+            now - last_attempt
+        ).total_seconds() < backoff_seconds(fail_count):
+            return False
+    last_ok = _parse_ts(row["last_ok_at"])
+    if last_ok is None:
+        return True
+    threshold = interval
+    if rng is not None:
+        threshold = interval * (1.0 + rng.uniform(0.0, 0.10))
+    return (now - last_ok).total_seconds() >= threshold
+
+
+def due_dates(
+    conn: sqlite3.Connection,
+    today: date,
+    now: datetime,
+    cfg: Config,
+    rng: random.Random | None = None,
+) -> list[str]:
+    """Tanggal jatuh tempo, urut dari offset terkecil (SPECS §5.3)."""
+    due: list[str] = []
+    for date_str in window_dates(today, cfg.window_days):
+        row = conn.execute(
+            "SELECT last_ok_at, last_attempt_at, fail_count FROM date_sync "
+            "WHERE booking_date = ?",
+            (date_str,),
+        ).fetchone()
+        interval = interval_for_offset(offset_of(date_str, today), cfg)
+        if _is_due(row, interval, now, rng):
+            due.append(date_str)
+    return due
+
+
+def _auth_allows_poll(
+    conn: sqlite3.Connection, token_file: TokenFile | None, now: datetime
+) -> bool:
+    if db.get_state(conn, "auth_ok", "1") != "0":
+        return True
+    if token_file is not None:
+        stored = db.get_state(conn, "auth_failed_token_mtime")
+        current = token_file.mtime_ns()
+        if current is not None and str(current) != (stored or ""):
+            return True
+    last_attempt = _parse_ts(db.get_state(conn, "auth_last_attempt_at"))
+    if last_attempt is None:
+        return True
+    return (now - last_attempt).total_seconds() >= 600
+
+
+def _mark_auth_failed(
+    conn: sqlite3.Connection,
+    token_file: TokenFile | None,
+    now: datetime,
+    code: str,
+) -> None:
+    with conn:
+        db.set_state(conn, "auth_ok", "0")
+        db.set_state(conn, "last_error", code)
+        db.set_state(conn, "auth_last_attempt_at", clock.utc_iso(now))
+        if token_file is not None:
+            mtime = token_file.mtime_ns()
+            if mtime is not None:
+                db.set_state(conn, "auth_failed_token_mtime", str(mtime))
+
+
+def _mark_fetch_failure(
+    conn: sqlite3.Connection, date_str: str, now: datetime, code: str
+) -> None:
+    with conn:
+        conn.execute(
+            "INSERT INTO date_sync (booking_date, last_attempt_at, fail_count, last_error) "
+            "VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(booking_date) DO UPDATE SET "
+            "  last_attempt_at = excluded.last_attempt_at, "
+            "  fail_count = date_sync.fail_count + 1, "
+            "  last_error = excluded.last_error",
+            (date_str, clock.utc_iso(now), code),
+        )
+        db.set_state(conn, "last_error", code)
+
+
+def check_baseline(
+    conn: sqlite3.Connection, cfg: Config, today: date, now: datetime
+) -> bool:
+    """Set ``baseline_done`` bila seluruh jendela pernah berhasil (FR-6)."""
+    if db.get_state(conn, "baseline_done") == "1":
+        return True
+    dates = window_dates(today, cfg.window_days)
+    placeholders = ",".join("?" * len(dates))
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM date_sync "
+        f"WHERE last_ok_at IS NOT NULL AND booking_date IN ({placeholders})",
+        dates,
+    ).fetchone()
+    if row["n"] == len(dates):
+        with conn:
+            db.set_state(conn, "baseline_done", "1")
+        return True
+    return False
+
+
+def _maybe_cleanup_events(
+    conn: sqlite3.Connection, now: datetime, retention_days: int
+) -> None:
+    last = _parse_ts(db.get_state(conn, "last_event_cleanup_at"))
+    if last is not None and (now - last).total_seconds() < 86400:
+        return
+    cutoff = clock.utc_iso(now - timedelta(days=retention_days))
+    with conn:
+        conn.execute("DELETE FROM booking_events WHERE ts < ?", (cutoff,))
+        db.set_state(conn, "last_event_cleanup_at", clock.utc_iso(now))
+
+
+async def run_tick(
+    conn: sqlite3.Connection,
+    client: Any,
+    cfg: Config,
+    *,
+    token_file: TokenFile | None = None,
+    state: SchedulerState | None = None,
+    delay: float = 0.0,
+    rng: random.Random | None = None,
+) -> list[dict[str, Any]]:
+    """Satu putaran scheduler: ambil semua tanggal jatuh tempo secara berurutan."""
+    now = clock.now()
+    today = clock.venue_now().date()
+
+    if state is not None and state.pause_until is not None and now < state.pause_until:
+        return []
+    if not _auth_allows_poll(conn, token_file, now):
+        return []
+
+    emit_events = db.get_state(conn, "baseline_done") == "1"
+    results: list[dict[str, Any]] = []
+    dates = due_dates(conn, today, now, cfg, rng)
+
+    for index, date_str in enumerate(dates):
+        if index > 0 and delay:
+            await asyncio.sleep(delay)
+        try:
+            counts = await fetch_and_apply(
+                conn, client, date_str, emit_events=emit_events, ts=clock.utc_iso()
+            )
+        except AuthError as exc:
+            code = type(exc).__name__
+            _mark_auth_failed(conn, token_file, now, code)
+            logger.error("auth state=auth_failed reason=%s", code)
+            results.append({"date": date_str, "error": code})
+            break
+        except AyoError as exc:
+            code = type(exc).__name__
+            _mark_fetch_failure(conn, date_str, now, code)
+            if state is not None:
+                state.consecutive_failures += 1
+                if state.consecutive_failures >= 3:
+                    state.pause_until = now + timedelta(seconds=60)
+                    state.consecutive_failures = 0
+            logger.warning("sync date=%s error=%s", date_str, code)
+            results.append({"date": date_str, "error": code})
+            continue
+
+        if state is not None:
+            state.consecutive_failures = 0
+            state.pause_until = None
+        db.set_state(conn, "last_error", "")
+        logger.info(
+            "sync date=%s created=%d updated=%d removed=%d restored=%d",
+            date_str,
+            counts["created"],
+            counts["updated"],
+            counts["removed"],
+            counts["restored"],
+        )
+        results.append({"date": date_str, **counts})
+
+    check_baseline(conn, cfg, today, now)
+    _maybe_cleanup_events(conn, now, cfg.event_retention_days)
+    return results
+
+
+async def scheduler_loop(
+    conn: sqlite3.Connection,
+    client: Any,
+    cfg: Config,
+    *,
+    token_file: TokenFile | None = None,
+    stop_event: asyncio.Event | None = None,
+    tick_seconds: float = 5.0,
+) -> None:
+    """Loop latar belakang. Dijalankan dari lifespan aplikasi (M3)."""
+    state = SchedulerState()
+    rng = random.Random()
+    while stop_event is None or not stop_event.is_set():
+        try:
+            await run_tick(
+                conn,
+                client,
+                cfg,
+                token_file=token_file,
+                state=state,
+                delay=0.5,
+                rng=rng,
+            )
+        except Exception as exc:  # noqa: BLE001 - loop tidak boleh mati
+            logger.error("scheduler tick gagal error=%s", type(exc).__name__)
+        if stop_event is None:
+            await asyncio.sleep(tick_seconds)
+        else:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=tick_seconds)
+                return
+            except asyncio.TimeoutError:
+                continue
+
+
+# --------------------------------------------------------------------------
+# Mode CLI: python -m app.sync --once
+# --------------------------------------------------------------------------
+
+
+async def run_once(cfg: Config) -> int:
+    """Ambil seluruh jendela sekali. Kode keluar 0 bila semua sukses."""
+    conn = db.connect(cfg.db_path)
+    try:
+        db.init_schema(conn)
+        token_file = TokenFile(cfg.token_file)
+        client = AyoClient(
+            base_url=cfg.base_url,
+            venue_id=cfg.venue_id,
+            field_ids=cfg.field_ids,
+            timeout=cfg.http_timeout,
+            token_provider=token_file.read,
+        )
+        try:
+            today = clock.venue_today()
+            emit_events = db.get_state(conn, "baseline_done") == "1"
+            dates = window_dates(today, cfg.window_days)
+            ok = failed = written = 0
+            for date_str in dates:
+                try:
+                    counts = await fetch_and_apply(
+                        conn,
+                        client,
+                        date_str,
+                        emit_events=emit_events,
+                        ts=clock.utc_iso(),
+                    )
+                except AuthError:
+                    print(f"ERROR once date={date_str} error=AuthError")
+                    return 2
+                except AyoError as exc:
+                    failed += 1
+                    print(f"WARNING once date={date_str} error={type(exc).__name__}")
+                    continue
+                ok += 1
+                written += counts["created"] + counts["updated"] + counts["restored"]
+                print(
+                    f"INFO once date={date_str} fields={counts['fields']} "
+                    f"created={counts['created']} updated={counts['updated']} "
+                    f"removed={counts['removed']} restored={counts['restored']}"
+                )
+            baseline = check_baseline(conn, cfg, today, clock.now())
+            print(
+                f"INFO once summary dates={len(dates)} ok={ok} failed={failed} "
+                f"written={written} baseline_done={int(baseline)}"
+            )
+            return 0 if failed == 0 else 1
+        finally:
+            await client.aclose()
+    finally:
+        conn.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="app.sync", description="AYO Booking Sync - mode CLI"
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="ambil seluruh jendela sekali secara berurutan lalu keluar",
+    )
+    args = parser.parse_args(argv)
+    if not args.once:
+        parser.error("hanya mode --once yang tersedia saat ini")
+    try:
+        return asyncio.run(run_once(load_config_for_cli()))
+    except ConfigError as exc:
+        print(f"ERROR config {exc}")
+        return 1
+    except sqlite3.Error as exc:
+        print(f"ERROR database {type(exc).__name__}")
+        return 1
+
+
+def load_config_for_cli() -> Config:
+    """Konfigurasi untuk CLI --once (tanpa mewajibkan AYO_API_KEY)."""
+    from .config import load_config
+
+    return load_config(require_api_key=False)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

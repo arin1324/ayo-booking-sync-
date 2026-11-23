@@ -32,6 +32,11 @@ class Config:
     window_days: int
     http_timeout: float
     free_statuses: tuple[str, ...]
+    poll_yesterday: int
+    poll_near: int
+    poll_mid: int
+    poll_far: int
+    event_retention_days: int
 
 
 def _as_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -74,12 +79,18 @@ def _as_int_tuple(
     return tuple(values)
 
 
-def load_config(env: Mapping[str, str] | None = None) -> Config:
-    """Baca konfigurasi dari environment. Gagal tertutup bila tidak valid."""
+def load_config(
+    env: Mapping[str, str] | None = None, *, require_api_key: bool = True
+) -> Config:
+    """Baca konfigurasi dari environment. Gagal tertutup bila tidak valid.
+
+    ``require_api_key=False`` dipakai oleh CLI ``--once`` yang tidak melayani
+    API HTTP, sehingga tidak memerlukan ``AYO_API_KEY``.
+    """
     e = os.environ if env is None else env
 
     api_key = (e.get("AYO_API_KEY") or "").strip()
-    if len(api_key) < 32:
+    if require_api_key and len(api_key) < 32:
         raise ConfigError("AYO_API_KEY wajib dan minimal 32 karakter.")
 
     field_ids = _as_int_tuple(e, "AYO_FIELD_IDS", DEFAULT_FIELD_IDS)
@@ -106,4 +117,9 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         window_days=window_days,
         http_timeout=_as_float(e, "AYO_HTTP_TIMEOUT", 15.0),
         free_statuses=free_statuses,
+        poll_yesterday=_as_int(e, "AYO_POLL_YESTERDAY", 3600),
+        poll_near=_as_int(e, "AYO_POLL_NEAR", 120),
+        poll_mid=_as_int(e, "AYO_POLL_MID", 600),
+        poll_far=_as_int(e, "AYO_POLL_FAR", 3600),
+        event_retention_days=_as_int(e, "EVENT_RETENTION_DAYS", 60),
     )

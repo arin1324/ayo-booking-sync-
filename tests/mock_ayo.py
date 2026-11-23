@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
+
+Responder = Callable[[str], "tuple[int, bytes, str]"]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -18,9 +20,12 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (nama wajib dari BaseHTTPRequestHandler)
         mock: "MockAyo" = self.server.mock  # type: ignore[attr-defined]
         mock.requests.append(self.path)
-        body = mock.body
-        self.send_response(mock.status)
-        self.send_header("Content-Type", mock.content_type)
+        if mock.responder is not None:
+            status, body, content_type = mock.responder(self.path)
+        else:
+            status, body, content_type = mock.status, mock.body, mock.content_type
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -37,8 +42,13 @@ class MockAyo:
         self.status: int = 200
         self.content_type: str = "application/json"
         self.body: bytes = b"{}"
+        self.responder: Responder | None = None
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def set_responder(self, responder: Responder) -> None:
+        """Respons dinamis per request: fn(path) -> (status, body, content_type)."""
+        self.responder = responder
 
     def set_json(self, payload: Any, status: int = 200) -> None:
         self.status = status

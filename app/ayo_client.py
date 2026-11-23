@@ -8,10 +8,16 @@ dilempar hanya memuat nama kelas error atau kode singkat, bukan pesan httpx
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Callable, Sequence
 
 import httpx
+
+# URL permintaan memuat token di query string. httpx/httpcore mencetak URL pada
+# level INFO, jadi logger mereka wajib WARNING atau lebih tinggi (SPECS §4.1, §8).
+for _noisy in ("httpx", "httpcore", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 RESERVATIONS_CALENDAR_PATH = "reservations-calendar"
 
@@ -53,6 +59,13 @@ class TokenFile:
                 raise FetchError("token_file_unreadable") from None
             self._mtime = mtime
         return self._value
+
+    def mtime_ns(self) -> int | None:
+        """mtime file token dalam nanodetik, atau ``None`` bila tidak ada."""
+        try:
+            return os.stat(self._path).st_mtime_ns
+        except OSError:
+            return None
 
 
 class AyoClient:
