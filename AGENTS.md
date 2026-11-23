@@ -24,7 +24,7 @@ Data venue (bukan rahasia, tetapi jangan dipakai di luar proyek ini):
 
 - Venue ID: `3749`
 - API produksi: `https://api.fitcitypadel.com` (Caddy, HTTPS)
-- Lapangan: `10479` sampai `10484` (Lapangan A sampai F), olahraga Padel, sesi 60 menit, jam buka 07:00 sampai 22:00 (dibaca dari respons AYO, jangan di-hardcode)
+- Lapangan: `10479` sampai `10484` (Lapangan A sampai F), olahraga Padel, sesi 60 menit, jam buka mengikuti respons AYO (observasi 2026-11-23: 08:00 sampai 23:00; selalu dibaca dari respons, jangan di-hardcode)
 - Sumber data: endpoint internal aplikasi AYO (`reservations-calendar`) yang memakai `mobile_token` milik pemilik. Pemilik sudah mengonfirmasi ke AYO bahwa pemakaian ini diizinkan hanya untuk venue miliknya sendiri. Sumber kedua (opsional, M6): daftar pelanggan di `gateway.ayo.co.id`. **Belum boleh dikerjakan** sebelum izin dan cara `signature`-nya dikonfirmasi AYO (PRD OD-9 dan OD-10).
 
 ## 2. Lingkungan

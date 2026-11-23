@@ -140,6 +140,11 @@ Risiko:
 | OD-10 | Cara menghitung `signature` pada request `customer-lists`, hubungan `token`-nya dengan `mobile_token`, dan masa berlakunya | Tidak diketahui; tidak boleh ditebak | M6 (penghalang) |
 | OD-11 | Arti `venue_id=0` (semua venue atau bawaan aplikasi) dan batas maksimum `limit` | Kirim seperti aplikasi; `limit` 50 | M6 |
 
+Catatan observasi (2026-11-23, sinkronisasi nyata pertama):
+
+- Jam operasional venue dari respons AYO: **08:00–23:00**, sesi 60 menit (catatan lama 07:00–22:00 tidak dipakai lagi).
+- Status booking yang terlihat pada `/schedule`: `MANUAL`. Status batal belum terlihat; OD-4 dan OD-7 tetap terbuka.
+
 ## 10. Kriteria keberhasilan
 
 - Pada pengecekan sampel, tidak ada kasus "tersedia" untuk slot yang sudah terlihat terisi di AYO lebih dari 1 menit sebelumnya (hari ini dan besok).
