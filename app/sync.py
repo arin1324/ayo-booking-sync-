@@ -1,7 +1,8 @@
 """Parser, algoritma diff, dan penerapan snapshot (SPECS §3.5, §5.6).
 
-Modul ini sengaja sinkron (sqlite3). Pemanggil async (scheduler/API) akan
-membungkusnya dengan ``asyncio.to_thread`` pada milestone berikutnya.
+Modul ini sengaja sinkron (sqlite3). Pemanggil async (scheduler/API) membungkus
+pekerjaan SQLite dengan :func:`app.db.run_blocking` agar event loop tidak
+terblokir (SPECS §8).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import logging
 import random
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -345,10 +347,23 @@ async def fetch_and_apply(
     *,
     emit_events: bool,
     ts: str,
+    db_lock: threading.Lock | None = None,
 ) -> dict[str, int]:
-    """Ambil satu tanggal dari AYO lalu terapkan. Dipakai scheduler dan API."""
+    """Ambil satu tanggal dari AYO lalu terapkan. Dipakai scheduler dan API.
+
+    Jaringan tetap async; penerapan snapshot (SQLite sinkron) dipindahkan ke
+    thread lain agar event loop bebas.
+    """
     data = await client.fetch_calendar(date)
-    return apply_snapshot(conn, date, data, emit_events=emit_events, ts=ts)
+    return await db.run_blocking(
+        apply_snapshot,
+        conn,
+        date,
+        data,
+        emit_events=emit_events,
+        ts=ts,
+        lock=db_lock,
+    )
 
 
 # Batas laju AYO: maksimal 3 request bersamaan, untuk scheduler DAN API
@@ -378,6 +393,9 @@ class FetchCoordinator:
         self.client = client
         self.cfg = cfg
         self.token_file = token_file
+        # Melindungi ``conn`` agar tidak dipakai dua thread sekaligus saat
+        # pekerjaan SQLite dipindahkan ke thread (SPECS §8).
+        self.db_lock = threading.Lock()
         self._sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
         self._locks: dict[str, asyncio.Lock] = {}
         self._in_flight: dict[str, asyncio.Task[Any]] = {}
@@ -393,7 +411,12 @@ class FetchCoordinator:
         async with self._lock(date):
             async with self._sem:
                 return await fetch_and_apply(
-                    self.conn, self.client, date, emit_events=emit_events, ts=clock.utc_iso()
+                    self.conn,
+                    self.client,
+                    date,
+                    emit_events=emit_events,
+                    ts=clock.utc_iso(),
+                    db_lock=self.db_lock,
                 )
 
     def start(self, date: str, *, emit_events: bool) -> asyncio.Task[Any]:
@@ -418,6 +441,22 @@ class FetchCoordinator:
 
     def mark_auth_failed(self, now: datetime, code: str) -> None:
         _mark_auth_failed(self.conn, self.token_file, now, code)
+
+    # --- versi async (memindahkan SQLite ke thread) ----------------------
+    async def auth_allows_async(self, now: datetime) -> bool:
+        return await db.run_blocking(
+            _auth_allows_poll, self.conn, self.token_file, now, lock=self.db_lock
+        )
+
+    async def mark_fetch_failure_async(self, date: str, now: datetime, code: str) -> None:
+        await db.run_blocking(
+            _mark_fetch_failure, self.conn, date, now, code, lock=self.db_lock
+        )
+
+    async def mark_auth_failed_async(self, now: datetime, code: str) -> None:
+        await db.run_blocking(
+            _mark_auth_failed, self.conn, self.token_file, now, code, lock=self.db_lock
+        )
 
 
 
@@ -602,23 +641,29 @@ async def run_tick(
     rng: random.Random | None = None,
     coordinator: FetchCoordinator | None = None,
 ) -> list[dict[str, Any]]:
-    """Satu putaran scheduler: ambil semua tanggal jatuh tempo secara berurutan."""
+    """Satu putaran scheduler: ambil semua tanggal jatuh tempo secara berurutan.
+
+    Seluruh akses SQLite dipindahkan ke thread (``db.run_blocking``) agar event
+    loop tetap responsif terhadap permintaan API.
+    """
     now = clock.now()
     today = clock.venue_now().date()
+    db_lock = coordinator.db_lock if coordinator is not None else None
 
     if state is not None and state.pause_until is not None and now < state.pause_until:
         return []
-    allowed = (
-        coordinator.auth_allows(now)
-        if coordinator is not None
-        else _auth_allows_poll(conn, token_file, now)
-    )
+    if coordinator is not None:
+        allowed = await coordinator.auth_allows_async(now)
+    else:
+        allowed = await db.run_blocking(_auth_allows_poll, conn, token_file, now)
     if not allowed:
         return []
 
-    emit_events = db.get_state(conn, "baseline_done") == "1"
+    emit_events = (
+        await db.run_blocking(db.get_state, conn, "baseline_done", lock=db_lock)
+    ) == "1"
     results: list[dict[str, Any]] = []
-    dates = due_dates(conn, today, now, cfg, rng)
+    dates = await db.run_blocking(due_dates, conn, today, now, cfg, rng, lock=db_lock)
 
     for index, date_str in enumerate(dates):
         if index > 0 and delay:
@@ -628,23 +673,28 @@ async def run_tick(
                 counts = await coordinator.fetch(date_str, emit_events=emit_events)
             else:
                 counts = await fetch_and_apply(
-                    conn, client, date_str, emit_events=emit_events, ts=clock.utc_iso()
+                    conn,
+                    client,
+                    date_str,
+                    emit_events=emit_events,
+                    ts=clock.utc_iso(),
+                    db_lock=db_lock,
                 )
         except AuthError as exc:
             code = type(exc).__name__
             if coordinator is not None:
-                coordinator.mark_auth_failed(now, code)
+                await coordinator.mark_auth_failed_async(now, code)
             else:
-                _mark_auth_failed(conn, token_file, now, code)
+                await db.run_blocking(_mark_auth_failed, conn, token_file, now, code)
             logger.error("auth state=auth_failed reason=%s", code)
             results.append({"date": date_str, "error": code})
             break
         except AyoError as exc:
             code = type(exc).__name__
             if coordinator is not None:
-                coordinator.mark_fetch_failure(date_str, now, code)
+                await coordinator.mark_fetch_failure_async(date_str, now, code)
             else:
-                _mark_fetch_failure(conn, date_str, now, code)
+                await db.run_blocking(_mark_fetch_failure, conn, date_str, now, code)
             if state is not None:
                 state.consecutive_failures += 1
                 if state.consecutive_failures >= 3:
@@ -657,7 +707,7 @@ async def run_tick(
         if state is not None:
             state.consecutive_failures = 0
             state.pause_until = None
-        db.set_state(conn, "last_error", "")
+        await db.run_blocking(db.set_state, conn, "last_error", "", lock=db_lock)
         logger.info(
             "sync date=%s created=%d updated=%d removed=%d restored=%d",
             date_str,
@@ -668,8 +718,10 @@ async def run_tick(
         )
         results.append({"date": date_str, **counts})
 
-    check_baseline(conn, cfg, today, now)
-    _maybe_cleanup_events(conn, now, cfg.event_retention_days)
+    await db.run_blocking(check_baseline, conn, cfg, today, now, lock=db_lock)
+    await db.run_blocking(
+        _maybe_cleanup_events, conn, now, cfg.event_retention_days, lock=db_lock
+    )
     return results
 
 

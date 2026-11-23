@@ -5,7 +5,10 @@ Scheduler dimatikan (``start_scheduler=False``) agar tidak ada request ke AYO.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -413,3 +416,76 @@ def test_t22_schedule_slash_variants(api_client, path):
     )
     assert response.status_code == 200
     assert response.status_code not in (307, 308)
+
+
+# --------------------------------------------------------------------------
+# T32 — batas laju API per kunci
+# --------------------------------------------------------------------------
+
+
+def test_t32_rate_limiter_window_resets():
+    limiter = api.RateLimiter(2, 60)
+    assert limiter.check("kunci", now=0.0) == (True, 0)
+    assert limiter.check("kunci", now=1.0)[0] is True
+    allowed, retry_after = limiter.check("kunci", now=2.0)
+    assert allowed is False
+    assert retry_after >= 1
+    # Kunci lain punya jendelanya sendiri.
+    assert limiter.check("kunci-lain", now=2.0)[0] is True
+    # Jendela baru setelah 60 detik.
+    assert limiter.check("kunci", now=61.0)[0] is True
+
+
+def test_t32_rate_limit_returns_429(tmp_path, make_config):
+    db_path = tmp_path / "ratelimit.db"
+    conn = db.connect(str(db_path))
+    db.init_schema(conn)
+    conn.close()
+    cfg = make_config(
+        db_path=str(db_path), api_key=API_KEY, api_rate_limit=2, api_rate_window=60
+    )
+    app = api.create_app(cfg, start_scheduler=False)
+    h = {"X-API-Key": API_KEY}
+    with TestClient(app) as client:
+        assert client.get("/fields", headers=h).status_code == 200
+        assert client.get("/fields", headers=h).status_code == 200
+        third = client.get("/fields", headers=h)
+        assert third.status_code == 429
+        assert third.json()["error"]["code"] == "rate_limited"
+        # /health tidak dibatasi (tanpa kunci).
+        assert client.get("/health").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# T33 — pekerjaan SQLite dipindahkan ke thread (event loop tetap bebas)
+# --------------------------------------------------------------------------
+
+
+def test_t33_run_blocking_uses_another_thread():
+    caller = threading.get_ident()
+
+    async def run():
+        return await db.run_blocking(threading.get_ident)
+
+    assert asyncio.run(run()) != caller
+
+
+def test_t33_run_blocking_lock_serializes():
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def work():
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        time.sleep(0.02)
+        active -= 1
+
+    async def run():
+        await asyncio.gather(
+            *[db.run_blocking(work, lock=lock) for _ in range(5)]
+        )
+
+    asyncio.run(run())
+    assert peak == 1

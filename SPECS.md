@@ -69,6 +69,8 @@ Dibaca dari environment (`EnvironmentFile=/etc/ayo-sync/env`). Aplikasi wajib ga
 | `AYO_CUSTOMER_FULL_POLL` | `21600` | Detik; sinkronisasi penuh |
 | `AYO_CUSTOMER_LIGHT_POLL` | `900` | Detik; pembaruan ringan (halaman pertama) |
 | `EVENT_RETENTION_DAYS` | `60` | |
+| `API_RATE_LIMIT` | `60` | Maksimum permintaan ber-kunci per jendela, per kunci API (§8). `/health` tidak dibatasi |
+| `API_RATE_WINDOW` | `60` | Detik; panjang jendela batas laju API |
 | `BIND_HOST` / `BIND_PORT` | `127.0.0.1` / `8000` | |
 | `LOG_LEVEL` | `INFO` | |
 
@@ -591,7 +593,8 @@ Contoh di atas memperlihatkan tiga keadaan: akun dengan profil dari AYO (`phone`
 - Token AYO di `/etc/ayo-sync/mobile_token`, izin 600, dimiliki user `ayo`. Tidak pernah diteruskan ke klien API dan tidak pernah muncul dalam respons atau log.
 - Dokumentasi otomatis FastAPI dimatikan (`docs_url=None`, `redoc_url=None`, `openapi_url=None`). Tidak ada CORS (komunikasi server ke server).
 - Pesan error ke klien tidak memuat jejak tumpukan (stack trace), path internal, atau detail AYO.
-- Rate limit sederhana pada API (sebaiknya, mis. 60 request per menit per kunci) agar bug di aplikasi pemilik tidak membanjiri AYO lewat pengambilan ulang; pembagian pengambilan di §6.5 sudah membatasi dampaknya ke AYO.
+- Rate limit sederhana pada API (bawaan 60 request per menit per kunci, `API_RATE_LIMIT`/`API_RATE_WINDOW`) agar bug di aplikasi pemilik tidak membanjiri AYO lewat pengambilan ulang; pembagian pengambilan di §6.5 sudah membatasi dampaknya ke AYO. `/health` tidak dibatasi.
+- Pekerjaan SQLite (parser/diff, ketersediaan, scheduler) dipindahkan ke thread lewat `db.run_blocking` (`asyncio.to_thread`) agar event loop tidak terblokir oleh transaksi tulis. Koneksi memakai `check_same_thread=False`; akses ke satu koneksi bersama dijaga kunci eksplisit (`FetchCoordinator.db_lock`).
 - Logger `httpx`, `httpcore`, `urllib3` diset ke WARNING. Ada test yang memastikan token uji tidak muncul di log.
 - Nama dan ID pelanggan hanya di `/schedule`, `/changes`, dan `/customer` (bila `AYO_EXPOSE_CUSTOMER=true`). `/schedule/availability` dan `/schedule/availability/day` tidak pernah memuatnya.
 - Telepon dan email pelanggan hanya tampil bila `AYO_EXPOSE_CUSTOMER_CONTACT=true` (bawaan `false`). Keduanya tidak pernah masuk log, `/health`, atau `booking_events`.
@@ -721,6 +724,8 @@ Test memakai `tests/mock_ayo.py` (server lokal yang meniru endpoint kalender, re
 | T29 | Token pelanggan, `signature`, telepon, dan email uji tidak muncul di log; `/health` tidak memuat data pelanggan | M6 |
 | T30 | `/customer` gabungan: himpunan (a), (b), (c); `type`; `q` (tidak mencocokkan telepon/email saat flag kontak `false`); `include_deleted`; `updated_since`; `sort`; paginasi; `phone` dan `email` hanya saat `AYO_EXPOSE_CUSTOMER_CONTACT=true` | M6 |
 | T31 | `AYO_CUSTOMER_ENABLED=false`: tidak ada satu pun request ke host pelanggan (dihitung di mock) | M6 |
+| T32 | Batas laju API: permintaan melebihi `API_RATE_LIMIT` per jendela per kunci → 429 `rate_limited`; kunci lain dan `/health` tidak terpengaruh; jendela pulih setelah `API_RATE_WINDOW` | M5 |
+| T33 | Pekerjaan SQLite dijalankan di thread lain lewat `db.run_blocking`; kunci bersama menyerialkan akses ke satu koneksi | M5 |
 
 Kriteria penerimaan per milestone:
 

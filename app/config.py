@@ -44,6 +44,8 @@ class Config:
     expose_customer: bool
     expose_customer_contact: bool
     customer_enabled: bool
+    api_rate_limit: int
+    api_rate_window: int
     bind_host: str
     bind_port: int
     log_level: str
@@ -151,6 +153,8 @@ def load_config(
         expose_customer=_as_bool(e, "AYO_EXPOSE_CUSTOMER", True),
         expose_customer_contact=_as_bool(e, "AYO_EXPOSE_CUSTOMER_CONTACT", False),
         customer_enabled=_as_bool(e, "AYO_CUSTOMER_ENABLED", False),
+        api_rate_limit=_as_int(e, "API_RATE_LIMIT", 60),
+        api_rate_window=_as_int(e, "API_RATE_WINDOW", 60),
         bind_host=e.get("BIND_HOST", "127.0.0.1"),
         bind_port=_as_int(e, "BIND_PORT", 8000),
         log_level=(e.get("LOG_LEVEL") or "INFO").upper(),

@@ -10,6 +10,8 @@ import asyncio
 import hmac
 import logging
 import sqlite3
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
@@ -55,6 +57,35 @@ def _parse_ts(value: str | None) -> datetime | None:
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+class RateLimiter:
+    """Batas laju sederhana per kunci API (jendela tetap, dalam memori).
+
+    Layanan berjalan sebagai satu proses/worker, jadi penghitung dalam memori
+    sudah cukup (SPECS §8). ``/health`` tidak memakai ini karena tanpa kunci.
+    ``now`` dapat diberikan pada test.
+    """
+
+    def __init__(self, limit: int, window_seconds: int) -> None:
+        self._limit = max(1, limit)
+        self._window = max(1, window_seconds)
+        self._lock = threading.Lock()
+        self._windows: dict[str, tuple[float, int]] = {}
+
+    def check(self, key: str, now: float | None = None) -> tuple[bool, int]:
+        """Kembalikan ``(diizinkan, retry_after_detik)``."""
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            start, count = self._windows.get(key, (current, 0))
+            if current - start >= self._window:
+                start, count = current, 0
+            count += 1
+            self._windows[key] = (start, count)
+            if count > self._limit:
+                retry_after = int(self._window - (current - start)) + 1
+                return False, max(1, retry_after)
+            return True, 0
 
 
 def create_app(
@@ -128,6 +159,8 @@ def create_app(
     )
     app.state.cfg = cfg
     app.state.db = provider
+    limiter = RateLimiter(cfg.api_rate_limit, cfg.api_rate_window)
+    app.state.limiter = limiter
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
@@ -152,6 +185,16 @@ def create_app(
             raise HTTPException(
                 status_code=401,
                 detail={"code": "unauthorized", "message": "Kunci API tidak valid atau tidak ada."},
+            )
+        app_limiter: RateLimiter = request.app.state.limiter
+        allowed, retry_after = app_limiter.check(x_api_key)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "rate_limited",
+                    "message": f"Terlalu banyak permintaan. Coba lagi dalam {retry_after} detik.",
+                },
             )
 
     # --- /health (tanpa kunci) ------------------------------------------
@@ -379,12 +422,19 @@ def create_app(
 
         source = await avail.ensure_fresh(day.isoformat())
         now = clock.now()
-        age = _data_age_seconds(avail, day.isoformat(), now)
-        fields = avail.compute(day.isoformat(), time, duration, field_id, age)
+
+        def _work() -> tuple[int | None, list[dict[str, object]], int]:
+            age = _data_age_seconds(avail, day.isoformat(), now)
+            fields = avail.compute(day.isoformat(), time, duration, field_id, age)
+            return age, fields, (duration or avail.default_duration(field_id))
+
+        age, fields, duration_minutes = await db.run_blocking(
+            _work, lock=avail.db_lock
+        )
         return {
             "date": day.isoformat(),
             "time": time,
-            "duration_minutes": duration or avail.default_duration(field_id),
+            "duration_minutes": duration_minutes,
             "checked_at": clock.utc_iso(now),
             "data_age_seconds": age,
             "data_source": source,
@@ -404,8 +454,13 @@ def create_app(
 
         source = await avail.ensure_fresh(day.isoformat())
         now = clock.now()
-        age = _data_age_seconds(avail, day.isoformat(), now)
-        fields = avail.compute_day(day.isoformat(), duration, field_id, age)
+
+        def _work() -> tuple[int | None, list[dict[str, object]]]:
+            age = _data_age_seconds(avail, day.isoformat(), now)
+            fields = avail.compute_day(day.isoformat(), duration, field_id, age)
+            return age, fields
+
+        age, fields = await db.run_blocking(_work, lock=avail.db_lock)
         return {
             "date": day.isoformat(),
             "data_age_seconds": age,

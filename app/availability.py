@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import threading
 from datetime import date as date_cls
 from datetime import datetime
 
@@ -118,6 +119,9 @@ class AvailabilityService:
         self.cfg = cfg
         self.coordinator = coordinator
         self.token_file = token_file
+        # Pakai kunci yang sama dengan koordinator agar ``conn`` tidak dipakai
+        # dua thread sekaligus (SPECS §8).
+        self.db_lock = coordinator.db_lock if coordinator is not None else threading.Lock()
 
     # --- akses data ------------------------------------------------------
     def _sync_row(self, date: str) -> sqlite3.Row | None:
@@ -186,14 +190,29 @@ class AvailabilityService:
     async def ensure_fresh(self, date: str) -> str:
         """Pastikan data ``date`` segar. Mengembalikan ``live``/``cache``/``stale``."""
         now = clock.now()
-        row = self._sync_row(date)
-        last_ok = _parse_ts(row["last_ok_at"]) if row is not None else None
-        if last_ok is not None and (now - last_ok).total_seconds() <= self.cfg.avail_max_age:
+
+        def _plan() -> tuple[bool, bool]:
+            row = self._sync_row(date)
+            last_ok = _parse_ts(row["last_ok_at"]) if row is not None else None
+            fresh = (
+                last_ok is not None
+                and (now - last_ok).total_seconds() <= self.cfg.avail_max_age
+            )
+            if fresh:
+                return True, False
+            return False, self._maybe_fetch(now, row)
+
+        fresh, want_fetch = await db.run_blocking(_plan, lock=self.db_lock)
+        if fresh:
             return CACHE
-        if not self._maybe_fetch(now, row) or self.coordinator is None:
+        if not want_fetch or self.coordinator is None:
             return STALE
 
-        emit_events = db.get_state(self.conn, "baseline_done") == "1"
+        emit_events = (
+            await db.run_blocking(
+                db.get_state, self.conn, "baseline_done", lock=self.db_lock
+            )
+        ) == "1"
         task = self.coordinator.start(date, emit_events=emit_events)
         try:
             await asyncio.wait_for(
@@ -201,10 +220,12 @@ class AvailabilityService:
             )
             return LIVE
         except AuthError as exc:
-            self.coordinator.mark_auth_failed(now, type(exc).__name__)
+            await self.coordinator.mark_auth_failed_async(now, type(exc).__name__)
             return STALE
         except AyoError as exc:
-            self.coordinator.mark_fetch_failure(date, now, type(exc).__name__)
+            await self.coordinator.mark_fetch_failure_async(
+                date, now, type(exc).__name__
+            )
             return STALE
         except asyncio.TimeoutError:
             return STALE

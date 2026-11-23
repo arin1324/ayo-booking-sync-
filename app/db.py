@@ -6,8 +6,13 @@ Data booking tidak pernah dihapus; hanya ``removed_at`` yang diisi.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+T = TypeVar("T")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fields (
@@ -95,8 +100,14 @@ CREATE INDEX IF NOT EXISTS idx_customers_name ON customers (name COLLATE NOCASE)
 
 
 def connect(path: str) -> sqlite3.Connection:
-    """Buka koneksi SQLite dengan pragma yang ditetapkan SPECS §4."""
-    conn = sqlite3.connect(path)
+    """Buka koneksi SQLite dengan pragma yang ditetapkan SPECS §4.
+
+    ``check_same_thread=False`` dipakai karena pekerjaan SQLite dipindahkan ke
+    thread lain lewat :func:`run_blocking` agar event loop tidak terblokir.
+    Akses ke satu koneksi yang sama dijaga kunci eksplisit (``run_blocking``)
+    sehingga tidak ada dua thread memakai koneksi yang sama bersamaan.
+    """
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -148,3 +159,26 @@ class Database:
         if existing is not None:
             existing.close()
             self._local.conn = None
+
+
+async def run_blocking(
+    func: Callable[..., T],
+    /,
+    *args: Any,
+    lock: threading.Lock | None = None,
+    **kwargs: Any,
+) -> T:
+    """Jalankan fungsi SQLite sinkron di thread lain agar event loop bebas.
+
+    Dipakai oleh endpoint async dan scheduler (SPECS §8). Bila ``lock``
+    diberikan, kunci itu dipegang selama fungsi berjalan sehingga satu koneksi
+    bersama tidak dipakai dua thread sekaligus.
+    """
+    if lock is None:
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    def work() -> T:
+        with lock:
+            return func(*args, **kwargs)
+
+    return await asyncio.to_thread(work)
