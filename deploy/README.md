@@ -83,6 +83,46 @@ sudo reboot
 Setelah reboot, ulangi `systemctl status ayo-sync` dan
 `curl -s https://api.fitcitypadel.com/health`.
 
+## 8. Monitoring uptime eksternal
+
+Tujuan: tahu bila layanan mati/DNS/TLS bermasalah, tanpa bergantung pada VPS itu
+sendiri. Rekomendasi: **UptimeRobot** (gratis, monitor HTTP dari luar).
+
+Buat monitor dengan setelan:
+
+- Tipe: **HTTP(s)**.
+- URL: `https://api.fitcitypadel.com/health`
+- Interval: 5 menit (batas paket gratis).
+- **Keyword**: `"status":"ok"` (monitor dianggap gagal bila keyword tidak ada,
+  sehingga status `stale`/`auth_failed` ikut terdeteksi).
+- Alert: email pemilik.
+
+Tidak ada data pelanggan yang dikirim; hanya status kesehatan.
+
+Alternatif tanpa akun pihak ketiga: cron di server aplikasi pemilik (server
+lain) yang menjalankan `curl -fsS https://api.fitcitypadel.com/health` dan
+mengirim email/notifikasi bila gagal.
+
+## 9. Remote git privat (backup kode)
+
+Repo saat ini hanya ada di VPS. Agar kode tidak hilang bila disk/VPS rusak:
+
+1. Buat repo **privat** kosong (GitHub/GitLab), jangan inisialisasi README.
+2. Tambahkan kunci publik VPS sebagai **Deploy Key** dengan akses **write**:
+   ```
+   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICenBUatSW0ENXy+TPx8y/XnlUyuUgS9YhuUiXbN5oZo ayo-sync-vps
+   ```
+   (kunci privat ada di `~/.ssh/ayo_sync_git`, izin 600; repo sudah diatur
+   memakai kunci ini lewat `core.sshCommand`)
+3. Dari VPS:
+   ```bash
+   cd /opt/ayo-sync
+   git remote add origin git@github.com:<akun>/<repo>.git
+   git push -u origin main
+   ```
+
+Jangan commit `.env`, token, atau database. `.gitignore` sudah menutup semuanya.
+
 ## Rollback
 
 ```bash
