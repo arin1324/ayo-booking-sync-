@@ -25,3 +25,7 @@ __pycache__/
 .vscode/
 *.swp
 .DS_Store
+
+# Dokumen pihak ketiga (mis. ringkasan API AYO — berstatus Confidential)
+*.xlsx
+*.xls
