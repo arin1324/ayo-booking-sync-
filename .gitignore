@@ -1,0 +1,27 @@
+# Rahasia dan data lokal — JANGAN pernah di-commit
+.env
+env
+token
+mobile_token
+customer_token
+*.token
+
+# Database SQLite
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

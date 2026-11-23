@@ -1,0 +1,84 @@
+{
+  "error": false,
+  "message": "Berhasil",
+  "data": [
+    {
+      "field_name": "Lapangan A",
+      "session_duration": 60,
+      "sport_name": "Padel",
+      "sport_id": 12,
+      "field_id": 10479,
+      "data": [
+        {
+          "id": 1001,
+          "field_id": 10479,
+          "user_id": 0,
+          "user_name": "Pelanggan Satu",
+          "reservation_type": "Normal",
+          "start_time": "07:00:00",
+          "end_time": "08:00:00",
+          "created_at": "2026-11-21T06:59:35.000000Z",
+          "status": null,
+          "total_price": 1,
+          "payment_method": "Transfer",
+          "payment_type": "MANUAL",
+          "final_status": "MANUAL",
+          "payment_rule": "MANUAL",
+          "source_table": "reservation",
+          "add_on_group_name": null
+        },
+        {
+          "id": 2001,
+          "field_id": 10479,
+          "user_id": 555,
+          "user_name": "Pelanggan Dua",
+          "reservation_type": "",
+          "start_time": "08:00:00",
+          "end_time": "09:00:00",
+          "created_at": "2026-11-21T14:16:02.000000Z",
+          "status": "FINISHED",
+          "total_price": 150000,
+          "payment_method": "",
+          "payment_type": "",
+          "final_status": "FINISHED",
+          "payment_rule": "BAYAR LUNAS",
+          "source_table": "order",
+          "add_on_group_name": null
+        },
+        {
+          "id": 1002,
+          "field_id": 10479,
+          "user_id": 0,
+          "user_name": "Pelanggan Tiga",
+          "reservation_type": "Normal",
+          "start_time": "14:00:00",
+          "end_time": "15:00:00",
+          "created_at": "2026-11-22T02:04:42.000000Z",
+          "status": null,
+          "total_price": 0,
+          "payment_method": null,
+          "payment_type": "",
+          "final_status": "MANUAL",
+          "payment_rule": "MANUAL",
+          "source_table": "reservation",
+          "add_on_group_name": ["Sewa Raket"]
+        }
+      ],
+      "start_time": "07:00:00",
+      "end_time": "22:00:00"
+    },
+    {
+      "field_name": "Lapangan B",
+      "session_duration": 60,
+      "sport_name": "Padel",
+      "sport_id": 12,
+      "field_id": 10480,
+      "data": [],
+      "start_time": "07:00:00",
+      "end_time": "22:00:00"
+    }
+  ],
+  "status_code": 200,
+  "signature": null,
+  "execution_time": 0.003
+}
