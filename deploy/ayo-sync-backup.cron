@@ -1,0 +1,8 @@
+# Backup harian database AYO Booking Sync (SPECS §9.5).
+# Pasang ke /etc/cron.d/ayo-sync-backup (milik root, izin 644).
+# Baris terakhir wajib diakhiri newline agar cron membacanya.
+#
+# 02:15 setiap hari sebagai user ayo; simpan 7 hari terakhir.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+15 2 * * * ayo sqlite3 /var/lib/ayo-sync/bookings.db ".backup '/var/backups/ayo-sync/bookings-$(date +\%F).db'" && find /var/backups/ayo-sync -name 'bookings-*.db' -mtime +7 -delete

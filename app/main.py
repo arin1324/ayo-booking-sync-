@@ -11,6 +11,11 @@ import logging
 from .api import create_app
 from .config import load_config
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+_config = load_config()
 
-app = create_app(load_config())
+logging.basicConfig(
+    level=getattr(logging, _config.log_level, logging.INFO),
+    format="%(levelname)s %(name)s %(message)s",
+)
+
+app = create_app(_config)

@@ -1,0 +1,22 @@
+[Unit]
+Description=AYO Booking Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ayo
+Group=ayo
+WorkingDirectory=/opt/ayo-sync
+EnvironmentFile=/etc/ayo-sync/env
+ExecStart=/opt/ayo-sync/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/ayo-sync
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target
