@@ -37,6 +37,10 @@ class Config:
     poll_mid: int
     poll_far: int
     event_retention_days: int
+    avail_fetch_timeout: float
+    avail_max_age: int
+    avail_min_retry: int
+    avail_stale_limit: int
     expose_customer: bool
     expose_customer_contact: bool
     customer_enabled: bool
@@ -140,6 +144,10 @@ def load_config(
         poll_mid=_as_int(e, "AYO_POLL_MID", 600),
         poll_far=_as_int(e, "AYO_POLL_FAR", 3600),
         event_retention_days=_as_int(e, "EVENT_RETENTION_DAYS", 60),
+        avail_fetch_timeout=_as_float(e, "AVAIL_FETCH_TIMEOUT", 5.0),
+        avail_max_age=_as_int(e, "AVAIL_MAX_AGE", 30),
+        avail_min_retry=_as_int(e, "AVAIL_MIN_RETRY", 10),
+        avail_stale_limit=_as_int(e, "AVAIL_STALE_LIMIT", 600),
         expose_customer=_as_bool(e, "AYO_EXPOSE_CUSTOMER", True),
         expose_customer_contact=_as_bool(e, "AYO_EXPOSE_CUSTOMER_CONTACT", False),
         customer_enabled=_as_bool(e, "AYO_CUSTOMER_ENABLED", False),

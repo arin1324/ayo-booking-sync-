@@ -351,6 +351,76 @@ async def fetch_and_apply(
     return apply_snapshot(conn, date, data, emit_events=emit_events, ts=ts)
 
 
+# Batas laju AYO: maksimal 3 request bersamaan, untuk scheduler DAN API
+# (SPECS §5.5). Jangan dinaikkan tanpa persetujuan pemilik.
+MAX_CONCURRENT_FETCHES = 3
+
+
+class FetchCoordinator:
+    """Pembagi pengambilan AYO antar scheduler dan API (SPECS §5.5, §6.5).
+
+    - Semaphore global membatasi maksimal ``MAX_CONCURRENT_FETCHES`` request.
+    - Kunci per tanggal mencegah dua pengambilan tanggal yang sama berjalan
+      bersamaan (scheduler + API).
+    - ``start()`` membagi satu task pengambilan: berapa pun pemanggil bersamaan
+      untuk tanggal yang sama, hanya **satu** request ke AYO.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        client: Any,
+        cfg: Config,
+        *,
+        token_file: TokenFile | None = None,
+    ) -> None:
+        self.conn = conn
+        self.client = client
+        self.cfg = cfg
+        self.token_file = token_file
+        self._sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._in_flight: dict[str, asyncio.Task[Any]] = {}
+
+    def _lock(self, date: str) -> asyncio.Lock:
+        lock = self._locks.get(date)
+        if lock is None:
+            lock = self._locks[date] = asyncio.Lock()
+        return lock
+
+    async def fetch(self, date: str, *, emit_events: bool) -> dict[str, int]:
+        """Ambil satu tanggal dengan kunci per tanggal dan semaphore global."""
+        async with self._lock(date):
+            async with self._sem:
+                return await fetch_and_apply(
+                    self.conn, self.client, date, emit_events=emit_events, ts=clock.utc_iso()
+                )
+
+    def start(self, date: str, *, emit_events: bool) -> asyncio.Task[Any]:
+        """Mulai (atau pakai ulang) satu task pengambilan untuk ``date``."""
+        task = self._in_flight.get(date)
+        if task is None or task.done():
+            task = asyncio.ensure_future(self.fetch(date, emit_events=emit_events))
+            self._in_flight[date] = task
+
+            def _forget(done: asyncio.Task[Any], key: str = date) -> None:
+                if self._in_flight.get(key) is done:
+                    self._in_flight.pop(key, None)
+
+            task.add_done_callback(_forget)
+        return task
+
+    def auth_allows(self, now: datetime) -> bool:
+        return _auth_allows_poll(self.conn, self.token_file, now)
+
+    def mark_fetch_failure(self, date: str, now: datetime, code: str) -> None:
+        _mark_fetch_failure(self.conn, date, now, code)
+
+    def mark_auth_failed(self, now: datetime, code: str) -> None:
+        _mark_auth_failed(self.conn, self.token_file, now, code)
+
+
+
 # --------------------------------------------------------------------------
 # Scheduler (SPECS §5.1–§5.4)
 # --------------------------------------------------------------------------
@@ -530,6 +600,7 @@ async def run_tick(
     state: SchedulerState | None = None,
     delay: float = 0.0,
     rng: random.Random | None = None,
+    coordinator: FetchCoordinator | None = None,
 ) -> list[dict[str, Any]]:
     """Satu putaran scheduler: ambil semua tanggal jatuh tempo secara berurutan."""
     now = clock.now()
@@ -537,7 +608,12 @@ async def run_tick(
 
     if state is not None and state.pause_until is not None and now < state.pause_until:
         return []
-    if not _auth_allows_poll(conn, token_file, now):
+    allowed = (
+        coordinator.auth_allows(now)
+        if coordinator is not None
+        else _auth_allows_poll(conn, token_file, now)
+    )
+    if not allowed:
         return []
 
     emit_events = db.get_state(conn, "baseline_done") == "1"
@@ -548,18 +624,27 @@ async def run_tick(
         if index > 0 and delay:
             await asyncio.sleep(delay)
         try:
-            counts = await fetch_and_apply(
-                conn, client, date_str, emit_events=emit_events, ts=clock.utc_iso()
-            )
+            if coordinator is not None:
+                counts = await coordinator.fetch(date_str, emit_events=emit_events)
+            else:
+                counts = await fetch_and_apply(
+                    conn, client, date_str, emit_events=emit_events, ts=clock.utc_iso()
+                )
         except AuthError as exc:
             code = type(exc).__name__
-            _mark_auth_failed(conn, token_file, now, code)
+            if coordinator is not None:
+                coordinator.mark_auth_failed(now, code)
+            else:
+                _mark_auth_failed(conn, token_file, now, code)
             logger.error("auth state=auth_failed reason=%s", code)
             results.append({"date": date_str, "error": code})
             break
         except AyoError as exc:
             code = type(exc).__name__
-            _mark_fetch_failure(conn, date_str, now, code)
+            if coordinator is not None:
+                coordinator.mark_fetch_failure(date_str, now, code)
+            else:
+                _mark_fetch_failure(conn, date_str, now, code)
             if state is not None:
                 state.consecutive_failures += 1
                 if state.consecutive_failures >= 3:
@@ -596,10 +681,13 @@ async def scheduler_loop(
     token_file: TokenFile | None = None,
     stop_event: asyncio.Event | None = None,
     tick_seconds: float = 5.0,
+    coordinator: FetchCoordinator | None = None,
 ) -> None:
     """Loop latar belakang. Dijalankan dari lifespan aplikasi (M3)."""
     state = SchedulerState()
     rng = random.Random()
+    if coordinator is None:
+        coordinator = FetchCoordinator(conn, client, cfg, token_file=token_file)
     while stop_event is None or not stop_event.is_set():
         try:
             await run_tick(
@@ -610,6 +698,7 @@ async def scheduler_loop(
                 state=state,
                 delay=0.5,
                 rng=rng,
+                coordinator=coordinator,
             )
         except Exception as exc:  # noqa: BLE001 - loop tidak boleh mati
             logger.error("scheduler tick gagal error=%s", type(exc).__name__)

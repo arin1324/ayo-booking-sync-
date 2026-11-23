@@ -21,9 +21,10 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__, clock, db
+from .availability import AvailabilityService, parse_hhmm
 from .ayo_client import AyoClient, TokenFile
 from .config import Config
-from .sync import scheduler_loop
+from .sync import FetchCoordinator, scheduler_loop
 
 logger = logging.getLogger("ayo.api")
 
@@ -61,8 +62,13 @@ def create_app(
     *,
     start_scheduler: bool = True,
     database: db.Database | None = None,
+    client: AyoClient | None = None,
 ) -> FastAPI:
-    """Bangun aplikasi FastAPI. ``start_scheduler=False`` dipakai pada test."""
+    """Bangun aplikasi FastAPI. ``start_scheduler=False`` dipakai pada test.
+
+    ``client`` boleh diberikan (mis. klien mock) agar endpoint ketersediaan dapat
+    mengambil ulang data tanpa jaringan.
+    """
     provider = database or db.Database(cfg.db_path)
 
     @asynccontextmanager
@@ -72,18 +78,34 @@ def create_app(
         db.init_schema(conn)
         stop_event = asyncio.Event()
         task: asyncio.Task[None] | None = None
-        client: AyoClient | None = None
-        if start_scheduler:
-            token_file = TokenFile(cfg.token_file)
-            client = AyoClient(
+        token_file = TokenFile(cfg.token_file)
+        ayo = client
+        if ayo is None and start_scheduler:
+            ayo = AyoClient(
                 base_url=cfg.base_url,
                 venue_id=cfg.venue_id,
                 field_ids=cfg.field_ids,
                 timeout=cfg.http_timeout,
                 token_provider=token_file.read,
             )
+        coordinator = (
+            FetchCoordinator(conn, ayo, cfg, token_file=token_file)
+            if ayo is not None
+            else None
+        )
+        app.state.avail = AvailabilityService(
+            conn, cfg, coordinator=coordinator, token_file=token_file
+        )
+        if start_scheduler and ayo is not None:
             task = asyncio.create_task(
-                scheduler_loop(conn, client, cfg, token_file=token_file, stop_event=stop_event)
+                scheduler_loop(
+                    conn,
+                    ayo,
+                    cfg,
+                    token_file=token_file,
+                    stop_event=stop_event,
+                    coordinator=coordinator,
+                )
             )
         try:
             yield
@@ -94,8 +116,8 @@ def create_app(
                     await asyncio.wait_for(task, timeout=5)
                 except asyncio.TimeoutError:
                     task.cancel()
-            if client is not None:
-                await client.aclose()
+            if ayo is not None:
+                await ayo.aclose()
 
     app = FastAPI(
         lifespan=lifespan,
@@ -311,6 +333,84 @@ def create_app(
             "next_since": next_since,
             "latest_event_id": latest_event_id,
             "has_more": has_more,
+        }
+
+    # --- /schedule/availability (M4) -------------------------------------
+    def _validate_time(value: str) -> int:
+        minutes = parse_hhmm(value)
+        if minutes is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_parameter",
+                    "message": "Parameter 'time' harus berformat HH:MM.",
+                },
+            )
+        return minutes
+
+    def _validate_window(day: date_cls, request: Request) -> None:
+        app_cfg: Config = request.app.state.cfg
+        limit = clock.venue_today() + timedelta(days=app_cfg.window_days - 1)
+        if day > limit:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "date_out_of_window",
+                    "message": "Tanggal melebihi jendela data yang tersedia.",
+                },
+            )
+
+    def _data_age_seconds(avail: AvailabilityService, date: str, now: datetime) -> int | None:
+        age = avail.age_seconds(date, now)
+        return None if age is None else int(age)
+
+    @app.get("/schedule/availability", dependencies=[Depends(require_api_key)])
+    async def availability(
+        request: Request,
+        date: str = Query(...),
+        time: str = Query(...),
+        duration: int | None = Query(default=None, ge=15, le=480),
+        field_id: list[int] | None = Query(default=None),
+    ) -> Any:
+        avail: AvailabilityService = request.app.state.avail
+        day = _parse_date(date, "date")
+        _validate_time(time)
+        _validate_window(day, request)
+
+        source = await avail.ensure_fresh(day.isoformat())
+        now = clock.now()
+        age = _data_age_seconds(avail, day.isoformat(), now)
+        fields = avail.compute(day.isoformat(), time, duration, field_id, age)
+        return {
+            "date": day.isoformat(),
+            "time": time,
+            "duration_minutes": duration or avail.default_duration(field_id),
+            "checked_at": clock.utc_iso(now),
+            "data_age_seconds": age,
+            "data_source": source,
+            "fields": fields,
+        }
+
+    @app.get("/schedule/availability/day", dependencies=[Depends(require_api_key)])
+    async def availability_day(
+        request: Request,
+        date: str = Query(...),
+        duration: int | None = Query(default=None, ge=15, le=480),
+        field_id: list[int] | None = Query(default=None),
+    ) -> Any:
+        avail: AvailabilityService = request.app.state.avail
+        day = _parse_date(date, "date")
+        _validate_window(day, request)
+
+        source = await avail.ensure_fresh(day.isoformat())
+        now = clock.now()
+        age = _data_age_seconds(avail, day.isoformat(), now)
+        fields = avail.compute_day(day.isoformat(), duration, field_id, age)
+        return {
+            "date": day.isoformat(),
+            "data_age_seconds": age,
+            "data_source": source,
+            "fields": fields,
         }
 
     # --- /customer (mode turunan; fitur AYO_CUSTOMER dimatikan) ----------
